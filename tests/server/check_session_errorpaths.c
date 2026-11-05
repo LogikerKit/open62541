@@ -193,6 +193,152 @@ START_TEST(Session_maxSessions_limit_rejectsWhenAllActivated) {
     UA_Client_disconnect(c3); UA_Client_delete(c3);
 } END_TEST
 
+/* Complementary regression matrix for maxSessions = 2. All Session
+ * creation, activation and token probes traverse the real service connection.
+ * Oldest/newest refer to creation order, independent of the timeout value. */
+static UA_StatusCode
+createSessionWithTimeout(UA_Client *client, UA_Double timeout,
+                         UA_CreateSessionResponse *outRes) {
+    UA_CreateSessionRequest req;
+    UA_CreateSessionRequest_init(&req);
+    req.requestedSessionTimeout = timeout;
+    __UA_Client_Service(client, &req, &UA_TYPES[UA_TYPES_CREATESESSIONREQUEST], outRes,
+                        &UA_TYPES[UA_TYPES_CREATESESSIONRESPONSE]);
+    return outRes->responseHeader.serviceResult;
+}
+
+static void
+sessionRegressionSetToken(UA_Client *client, const UA_NodeId *token) {
+    UA_NodeId_clear(&client->authenticationToken);
+    ck_assert_uint_eq(UA_NodeId_copy(token, &client->authenticationToken),
+                      UA_STATUSCODE_GOOD);
+}
+
+static UA_StatusCode
+sessionRegressionRead(UA_Client *client, const UA_NodeId *token) {
+    UA_ReadRequest req;
+    UA_ReadRequest_init(&req);
+    ck_assert_uint_eq(UA_NodeId_copy(token, &req.requestHeader.authenticationToken),
+                      UA_STATUSCODE_GOOD);
+    UA_ReadValueId node;
+    UA_ReadValueId_init(&node);
+    node.nodeId = UA_NODEID_NUMERIC(0, UA_NS0ID_SERVER_SERVERSTATUS_STATE);
+    node.attributeId = UA_ATTRIBUTEID_VALUE;
+    req.nodesToRead = &node;
+    req.nodesToReadSize = 1;
+    UA_ReadResponse res;
+    UA_ReadResponse_init(&res);
+    __UA_Client_Service(client, &req, &UA_TYPES[UA_TYPES_READREQUEST], &res,
+                        &UA_TYPES[UA_TYPES_READRESPONSE]);
+    UA_StatusCode status = res.responseHeader.serviceResult;
+    if(status == UA_STATUSCODE_GOOD) {
+        ck_assert_uint_eq(res.resultsSize, 1);
+        ck_assert_uint_eq(res.results[0].status, UA_STATUSCODE_GOOD);
+        ck_assert(res.results[0].hasValue);
+    }
+    UA_NodeId_clear(&req.requestHeader.authenticationToken);
+    UA_ReadResponse_clear(&res);
+    return status;
+}
+
+static void
+sessionAdmissionRegression(unsigned initialActiveMask, unsigned arrivals,
+                           UA_Boolean reverseTimeouts) {
+    /* initial peers 0,1; then up to three replacement peers 2,3,4 */
+    UA_Client *clients[5] = {NULL};
+    UA_CreateSessionResponse responses[5];
+    UA_Boolean live[5] = {true, true, false, false, false};
+    ck_assert(arrivals >= 1 && arrivals <= 3);
+    for(unsigned i = 0; i < 2 + arrivals; i++) {
+        clients[i] = UA_Client_newForUnitTest();
+        ck_assert(clients[i] != NULL);
+        UA_CreateSessionResponse_init(&responses[i]);
+        ck_assert_uint_eq(
+            UA_Client_connectSecureChannel(clients[i], "opc.tcp://localhost:4840"),
+            UA_STATUSCODE_GOOD);
+        ck_assert(UA_Client_getConfig(clients[i])->noSession);
+        if(i < 2) {
+            UA_Double timeout = reverseTimeouts && i == 1 ? 20000 : 60000;
+            ck_assert_uint_eq(
+                createSessionWithTimeout(clients[i], timeout, &responses[i]),
+                UA_STATUSCODE_GOOD);
+            if(initialActiveMask & (1u << i)) {
+                sessionRegressionSetToken(clients[i], &responses[i].authenticationToken);
+                ck_assert_uint_eq(activateSession(clients[i]), UA_STATUSCODE_GOOD);
+            }
+        }
+    }
+    if(reverseTimeouts)
+        ck_assert(responses[0].revisedSessionTimeout >
+                  responses[1].revisedSessionTimeout);
+
+    for(unsigned step = 0; step < arrivals; step++) {
+        unsigned incoming = 2 + step;
+        unsigned victim = 0;
+        while(victim < incoming &&
+              (!live[victim] || (victim < 2 && (initialActiveMask & (1u << victim)))))
+            victim++;
+        ck_assert(victim < incoming); /* These four histories have a victim. */
+        ck_assert_uint_eq(
+            createSessionWithTimeout(clients[incoming], 60000, &responses[incoming]),
+            UA_STATUSCODE_GOOD);
+        live[victim] = false;
+        live[incoming] = true;
+
+        /* Active Sessions stay usable after each replacement. */
+        for(unsigned i = 0; i < 2; i++) {
+            if(initialActiveMask & (1u << i))
+                ck_assert_uint_eq(
+                    sessionRegressionRead(clients[i], &responses[i].authenticationToken),
+                    UA_STATUSCODE_GOOD);
+        }
+        /* Every removed token remains invalid, including an earlier arrival. */
+        for(unsigned i = 0; i < incoming; i++) {
+            if(live[i])
+                continue;
+            ck_assert_uint_eq(
+                sessionRegressionRead(clients[i], &responses[i].authenticationToken),
+                UA_STATUSCODE_BADSESSIONIDINVALID);
+            sessionRegressionSetToken(clients[i], &responses[i].authenticationToken);
+            ck_assert_uint_eq(activateSession(clients[i]),
+                              UA_STATUSCODE_BADSESSIONIDINVALID);
+        }
+    }
+    /* Surviving pending Sessions can activate after the final replacement. */
+    for(unsigned i = 0; i < 2 + arrivals; i++) {
+        if(!live[i])
+            continue;
+        if(i >= 2 || !(initialActiveMask & (1u << i))) {
+            sessionRegressionSetToken(clients[i], &responses[i].authenticationToken);
+            ck_assert_uint_eq(activateSession(clients[i]), UA_STATUSCODE_GOOD);
+        }
+        ck_assert_uint_eq(
+            sessionRegressionRead(clients[i], &responses[i].authenticationToken),
+            UA_STATUSCODE_GOOD);
+    }
+    for(unsigned i = 0; i < 2 + arrivals; i++) {
+        UA_CreateSessionResponse_clear(&responses[i]);
+        UA_Client_disconnect(clients[i]);
+        UA_Client_delete(clients[i]);
+    }
+}
+
+START_TEST(Session_maxSessions_mixedOldestActive) {
+    sessionAdmissionRegression(1, 1, false);
+} END_TEST
+
+START_TEST(Session_maxSessions_mixedNewestActive) {
+    sessionAdmissionRegression(2, 1, false);
+} END_TEST
+
+START_TEST(Session_maxSessions_creationOrderNotTimeoutOrder) {
+    sessionAdmissionRegression(0, 1, true);
+} END_TEST
+
+START_TEST(Session_maxSessions_repeatedReplacement) {
+    sessionAdmissionRegression(0, 3, false);
+} END_TEST
+
 /* Get/Set/Delete attribute on a non-existent session id must fail
  * cleanly with BADSESSIONIDINVALID. This exercises the lookup miss path
  * in getBoundSession. */
@@ -625,6 +771,10 @@ static Suite* testSuite_SessionErrorPaths(void) {
     tcase_add_checked_fixture(tc, setup, teardown);
     tcase_add_test(tc, Session_maxSessions_limit_purgesOldestUnactivated);
     tcase_add_test(tc, Session_maxSessions_limit_rejectsWhenAllActivated);
+    tcase_add_test(tc, Session_maxSessions_mixedOldestActive);
+    tcase_add_test(tc, Session_maxSessions_mixedNewestActive);
+    tcase_add_test(tc, Session_maxSessions_creationOrderNotTimeoutOrder);
+    tcase_add_test(tc, Session_maxSessions_repeatedReplacement);
     tcase_add_test(tc, Session_attribute_unknownSession);
     tcase_add_test(tc, Session_attribute_scalar_helpers);
     tcase_add_test(tc, Session_closeTwiceFails);
